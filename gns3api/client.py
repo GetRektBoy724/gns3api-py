@@ -8,6 +8,7 @@ server's own OpenAPI spec (`/openapi.json`).
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 import requests
@@ -40,15 +41,34 @@ class Gns3Client:
         if self._token is None:
             self.authenticate()
 
+    def _send_with_retry(self, method: str, url: str, retries: int, **kwargs):
+        # Some GNS3 setups (e.g. behind a proxy) drop keep-alive connections
+        # after just one or two requests. Recreate the session (fresh TCP
+        # connection) and retry on transient connection errors instead of
+        # failing the whole call.
+        last_error: Exception = RuntimeError("no attempt made")
+        for attempt in range(retries + 1):
+            try:
+                return self.session.request(method, url, **kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_error = exc
+                self.session.close()
+                self.session = requests.Session()
+                self.session.verify = self.verify
+                if self._token is not None:
+                    self.session.headers["Authorization"] = f"Bearer {self._token}"
+                time.sleep(0.5 * (attempt + 1))
+        raise last_error
+
     # -- low level --------------------------------------------------------
-    def _request(self, method: str, path: str, **kwargs) -> Any:
+    def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> Any:
         self._ensure_auth()
         url = f"{self.base_url}{path}"
-        resp = self.session.request(method, url, **kwargs)
+        resp = self._send_with_retry(method, url, retries, **kwargs)
         if resp.status_code == 401 and self._token is not None:
             # token may have expired; retry once after re-authenticating
             self.authenticate()
-            resp = self.session.request(method, url, **kwargs)
+            resp = self._send_with_retry(method, url, retries, **kwargs)
         if not resp.ok:
             try:
                 detail = resp.json().get("detail", resp.text)
