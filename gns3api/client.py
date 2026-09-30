@@ -9,10 +9,12 @@ server's own OpenAPI spec (`/openapi.json`).
 from __future__ import annotations
 
 import time
+from urllib.parse import urlparse
 from typing import Any, Optional
 
 import requests
 
+from .console import Console, push_file
 from .exceptions import Gns3ApiError
 
 
@@ -61,7 +63,7 @@ class Gns3Client:
         raise last_error
 
     # -- low level --------------------------------------------------------
-    def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> Any:
+    def _request(self, method: str, path: str, retries: int = 3, raw: bool = False, **kwargs) -> Any:
         self._ensure_auth()
         url = f"{self.base_url}{path}"
         resp = self._send_with_retry(method, url, retries, **kwargs)
@@ -77,7 +79,7 @@ class Gns3Client:
             raise Gns3ApiError(resp.status_code, detail, method, path)
         if resp.status_code == 204 or not resp.content:
             return None
-        return resp.json()
+        return resp.text if raw else resp.json()
 
     def get(self, path: str, **kwargs) -> Any:
         return self._request("GET", path, **kwargs)
@@ -203,4 +205,120 @@ class Gns3Client:
     ) -> dict:
         return self.post(
             f"/v3/projects/{project_id}/templates/{template_id}", json={"x": x, "y": y}
+        )
+
+    # -- consoles -------------------------------------------------------------
+    def console_endpoint(self, node: dict) -> tuple[str, int]:
+        # The nodes API reports console_host as a bind-all placeholder
+        # ("0.0.0.0", "::", "127.0.0.1"); connecting to it targets the local
+        # machine instead of the controller and fails with ECONNREFUSED.
+        host = node.get("console_host")
+        if not host or host in ("0.0.0.0", "::", "127.0.0.1", "localhost"):
+            parsed = urlparse(self.base_url)
+            host = parsed.hostname
+        port = node.get("console")
+        if not port:
+            raise Gns3ApiError(400, "node has no console port (is it started?)", "GET", "console")
+        return host, port
+
+    def get_console(self, project_id: str, node_id: str) -> tuple[str, int]:
+        # A closed project returns node dicts without console fields;
+        # open it first so the payload is complete.
+        node = self.get_node(project_id, node_id)
+        if not node.get("console"):
+            self.open_project(project_id)
+            node = self.get_node(project_id, node_id)
+        return self.console_endpoint(node)
+
+    # -- node files -------------------------------------------------------------
+    def read_node_file(self, project_id: str, node_id: str, path: str) -> str:
+        # Works for controller-managed paths such as /etc/network/interfaces;
+        # for /root the files API silently 404s on read - use the node console.
+        resp = self._request(
+            "GET",
+            f"/v3/projects/{project_id}/nodes/{node_id}/files{path}",
+            raw=True,
+        )
+        return resp if isinstance(resp, str) else (resp.get("content", "") if resp else "")
+
+    def write_node_file(
+        self, project_id: str, node_id: str, path: str, content: str
+    ) -> None:
+        # Content-Type must be application/octet-stream (raw body); a JSON
+        # body corrupts the target file.
+        self._request(
+            "POST",
+            f"/v3/projects/{project_id}/nodes/{node_id}/files{path}",
+            data=content.encode(),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    def console_exec(self, project_id: str, node_id: str, command: str, timeout: float = 30.0) -> str:
+        host, port = self.get_console(project_id, node_id)
+        with Console(host, port) as con:
+            return con.exec(command, timeout=timeout)
+
+    def push_node_file(
+        self, project_id: str, node_id: str, path: str, content: str,
+        mode: int | None = None, timeout: float = 120.0,
+    ) -> str:
+        # Console-channel write: unlike write_node_file this reaches /root
+        # and any other path, at the cost of the node being started and the
+        # file arriving as base64 chunks through the PTY.
+        host, port = self.get_console(project_id, node_id)
+        return push_file(host, port, path, content, mode=mode, timeout=timeout)
+
+    # -- idempotent builders ----------------------------------------------------
+    def ensure_node(
+        self, project_id: str, name: str, template_id: str, **properties
+    ) -> dict:
+        # Creates the node if absent; on an existing node it only reconciles
+        # the adapter count upwards (GNS3 refuses to shrink while links exist)
+        # and never invents a fresh position.
+        node = self.find_node(project_id, name)
+        if node is None:
+            body = {"template_id": template_id, "name": name}
+            body.update(properties)
+            return self.create_node(project_id, **body)
+        adapters = properties.get("properties", {}).get("adapters")
+        current = node.get("properties", {}).get("adapters")
+        if adapters and isinstance(current, int) and not isinstance(current, bool):
+            if current != adapters:
+                if current > adapters:
+                    raise Gns3ApiError(
+                        500, f"node '{name}' has {current} adapters (> {adapters}) "
+                             "and cannot be shrunk while links exist",
+                        "PUT", "adapters",
+                    )
+                self.update_node(project_id, node["node_id"], adapters=adapters)
+        return self.get_node(project_id, node["node_id"])
+
+    def ensure_link(
+        self,
+        project_id: str,
+        node_a_id: str,
+        adapter_a: int,
+        port_a: int,
+        node_b_id: str,
+        adapter_b: int,
+        port_b: int,
+    ) -> dict:
+        # Skips creation when the same endpoint pair is already wired;
+        # endpoint order is irrelevant for the comparison.
+        want = frozenset({
+            (node_a_id, adapter_a, port_a),
+            (node_b_id, adapter_b, port_b),
+        })
+        have = self.list_links(project_id)
+        for link in have:
+            endpoints = frozenset({
+                (e["node_id"], e["adapter_number"], e["port_number"])
+                for e in link.get("nodes", [])
+            })
+            if endpoints == want:
+                return link
+        return self.create_link(
+            project_id,
+            node_a_id=node_a_id, adapter_a=adapter_a, port_a=port_a,
+            node_b_id=node_b_id, adapter_b=adapter_b, port_b=port_b,
         )
