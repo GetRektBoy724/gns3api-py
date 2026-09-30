@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import requests
 
-from .console import Console, push_file
+from .console import Console, pull_file, push_file
 from .exceptions import Gns3ApiError
 
 
@@ -222,9 +222,14 @@ class Gns3Client:
         return host, port
 
     def get_console(self, project_id: str, node_id: str) -> tuple[str, int]:
-        # A closed project returns node dicts without console fields;
-        # open it first so the payload is complete.
-        node = self.get_node(project_id, node_id)
+        # A closed project blocks node reads outright (403 "not opened") or,
+        # when half-open, returns stripped payloads without console fields;
+        # both states are healed by opening the project first.
+        try:
+            node = self.get_node(project_id, node_id)
+        except Gns3ApiError:
+            self.open_project(project_id)
+            node = self.get_node(project_id, node_id)
         if not node.get("console"):
             self.open_project(project_id)
             node = self.get_node(project_id, node_id)
@@ -253,7 +258,25 @@ class Gns3Client:
             headers={"Content-Type": "application/octet-stream"},
         )
 
+    def _ensure_node_running(self, project_id: str, node_id: str, wait: int = 90) -> None:
+        # A stopped node has no listening console; start and wait before
+        # attempting any console session.
+        node = self.get_node(project_id, node_id)
+        if node.get("status") == "started":
+            return
+        self.start_node(project_id, node_id)
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            time.sleep(1)
+            if self.get_node(project_id, node_id).get("status") == "started":
+                # debinet's boot runs /root/init.sh synchronously; give
+                # the resulting shell a settle window before console work
+                time.sleep(5)
+                return
+        raise Gns3ApiError(500, "node did not reach started state", "POST", "start")
+
     def console_exec(self, project_id: str, node_id: str, command: str, timeout: float = 30.0) -> str:
+        self._ensure_node_running(project_id, node_id)
         host, port = self.get_console(project_id, node_id)
         with Console(host, port) as con:
             return con.exec(command, timeout=timeout)
@@ -265,8 +288,18 @@ class Gns3Client:
         # Console-channel write: unlike write_node_file this reaches /root
         # and any other path, at the cost of the node being started and the
         # file arriving as base64 chunks through the PTY.
+        self._ensure_node_running(project_id, node_id)
         host, port = self.get_console(project_id, node_id)
         return push_file(host, port, path, content, mode=mode, timeout=timeout)
+
+    def pull_node_file(self, project_id: str, node_id: str, path: str,
+                       timeout: float = 60.0) -> str:
+        # Console-channel read: the counterpart of push_node_file, working
+        # for every path including /root (the files API 404s there). The
+        # transfer is base64 so binary content stays intact.
+        self._ensure_node_running(project_id, node_id)
+        host, port = self.get_console(project_id, node_id)
+        return pull_file(host, port, path, timeout=timeout)
 
     # -- idempotent builders ----------------------------------------------------
     def ensure_node(

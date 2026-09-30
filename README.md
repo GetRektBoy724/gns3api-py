@@ -47,6 +47,14 @@ iface = client.read_node_file(project_id, node_id, "/etc/network/interfaces")
 client.write_node_file(project_id, node_id, "/etc/network/interfaces", iface)
 ```
 
+For reading back, `pull_node_file()` is the console-channel counterpart of
+`push_node_file()`: it works on every path (/root included) and transfers
+base64 so binary content survives.
+
+```python
+text = client.pull_node_file(project_id, node_id, "/root/init.sh")
+```
+
 ## Console endpoints
 
 The `console_host` field of every node is a bind-all placeholder
@@ -104,7 +112,8 @@ client.ensure_link(project_id, node_a["node_id"], 1, 0, node_b["node_id"], 0, 0)
 update/delete, start/stop/suspend/reload, plus project open/close), node
 file injection (`read/write_node_file`), console endpoint resolution
 (`get_console`, `console_endpoint`), console shell execution
-(`console_exec`), console-channel file push (`push_node_file`), and the
+(`console_exec`), console-channel file transfer (`push_node_file`,
+`pull_node_file`), and the
 idempotent builders (`ensure_node`, `ensure_link`). See
 [`gns3api/client.py`](gns3api/client.py) for the full method list, or the
 server's `/docs` and `/openapi.json` for the complete API surface.
