@@ -15,7 +15,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 # sized so that "printf '%s' '<chunk>'" stays under the ~255-byte canonical
 # PTY line limit on debinet-style consoles
-CHUNK_SIZE = 160
+CHUNK_SIZE = 120
 
 
 def _strip_iac_filter(data: bytes, pending: bytes) -> tuple[bytes, bytes]:
@@ -151,7 +151,7 @@ def push_file(
         con.send_line(f"rm -f {tmp}")
         for chunk in chunks:
             con.send_line(f"printf '%s' '{chunk}' >> {tmp}")
-            time.sleep(0.05)
+            time.sleep(0.08)
         expected = str(len(payload))
         con.send_line(f"echo SZ$(wc -c <{tmp})Z")
         ok, _ = con.read_until(f"SZ{expected}Z".encode(), timeout)
@@ -174,3 +174,26 @@ def push_file(
             raise RuntimeError(f"after-write size check failed for {path} - {out[-120:]}")
 
     return f"written {path}: {len(content)} bytes" + (f" (mode {mode:o})" if mode else "")
+
+
+def pull_file(host: str, port: int, path: str, timeout: float = 60.0) -> str:
+    """Reads ``path`` through a console session (any path, /root included).
+    The node base64-encodes the file into one output line, so binary
+    content survives the transport; the caller receives the decoded text."""
+    with Console(host, port) as con:
+        con.drain()
+        tag = f"PL{time.time_ns() % 937:03d}"
+        con.buf = b""
+        con.send_line(f"base64 -w0 {path} 2>/dev/null; echo {tag}$?{tag}")
+        ok, out = con.read_until((tag + "0" + tag).encode(), timeout)
+        if not ok:
+            raise RuntimeError(f"read of {path} timed out - partial stream tail: {out[-160:]!r}")
+
+        body = _ANSI_RE.sub("", out).split("\n", 1)[-1]
+        body = body[: body.rfind(tag)]
+        # bracketed-paste toggles (esc[?2004l) ride along inside long output
+        # echo - without stripping them the payload misaligns
+        payload = "".join(body.split())
+        if not payload:
+            raise RuntimeError(f"{path} unreadable or empty on the node")
+        return base64.b64decode(payload).decode()
