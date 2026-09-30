@@ -83,7 +83,10 @@ class Gns3Client:
         return self._request("GET", path, **kwargs)
 
     def post(self, path: str, json: Any = None, **kwargs) -> Any:
-        return self._request("POST", path, json=json, **kwargs)
+        # Action endpoints (start/stop/open/close/...) require an actual
+        # empty JSON body -- sending none at all makes the server 422 with
+        # "Field required" even though the schema has no required fields.
+        return self._request("POST", path, json=json if json is not None else {}, **kwargs)
 
     def put(self, path: str, json: Any = None, **kwargs) -> Any:
         return self._request("PUT", path, json=json, **kwargs)
